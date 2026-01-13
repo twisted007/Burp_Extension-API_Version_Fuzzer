@@ -24,7 +24,7 @@ public class ApiVersionFuzzer implements BurpExtension {
     private JLabel statusLabel;
     private JCheckBox enablePassiveScan;
 
-    // The list of versions we want to inject
+    // Updated with your specific list
     private static final String[] VERSION_STRINGS = {
             "v1", "v2", "v3", "v1beta1", "v1beta2", "v1alpha1", "v1alpha2",
             "v2beta1", "v2beta2", "v2alpha1", "v2alpha2",
@@ -50,13 +50,19 @@ public class ApiVersionFuzzer implements BurpExtension {
         tableModel = new ResultsTableModel();
         JTable table = new JTable(tableModel);
 
+        // --- NEW: Enable Sorting ---
+        table.setAutoCreateRowSorter(true);
+
         JPopupMenu tablePopup = new JPopupMenu();
         JMenuItem sendToRepeater = new JMenuItem("Send to Repeater");
         sendToRepeater.addActionListener(e -> {
             int row = table.getSelectedRow();
             if (row != -1) {
-                LogEntry entry = tableModel.getLogEntry(row);
-                // Send the original request to Repeater with a tab name
+                // When sorting is enabled, the visual row index doesn't match the model index.
+                // We must convert the index to get the correct data.
+                int modelRow = table.convertRowIndexToModel(row);
+                LogEntry entry = tableModel.getLogEntry(modelRow);
+                
                 api.repeater().sendToRepeater(entry.httpRequestResponse.request(), "Fuzzed: " + entry.modifiedPath);
             }
         });
@@ -89,7 +95,6 @@ public class ApiVersionFuzzer implements BurpExtension {
         HttpService service = baseRequest.httpService();
         String url = baseRequest.url();
 
-        // Deduplication: Don't fuzz requests that we sent ourselves
         if (baseRequest.hasHeader("X-Api-Fuzzer")) {
             return;
         }
@@ -145,7 +150,6 @@ public class ApiVersionFuzzer implements BurpExtension {
     }
 
     private class PassiveScanner implements HttpHandler {
-        // FIX: Method name changed from handleRequestToBeSent to handleHttpRequestToBeSent
         @Override
         public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
             if (enablePassiveScan.isSelected()) {
@@ -168,8 +172,8 @@ public class ApiVersionFuzzer implements BurpExtension {
 
             item.addActionListener(e -> {
                 if (event.messageEditorRequestResponse().isPresent()) {
-                    MessageEditorHttpRequestResponse editorItem = event.messageEditorRequestResponse().get();
-                    runFuzzer(editorItem.requestResponse().request(), false);
+                     MessageEditorHttpRequestResponse editorItem = event.messageEditorRequestResponse().get();
+                     runFuzzer(editorItem.requestResponse().request(), false);
                 }
 
                 List<HttpRequestResponse> historyItems = event.selectedRequestResponses();
@@ -217,6 +221,17 @@ public class ApiVersionFuzzer implements BurpExtension {
         public int getColumnCount() { return columns.length; }
         @Override
         public String getColumnName(int column) { return columns[column]; }
+
+        // --- NEW: Define column types for correct sorting (Numbers vs Strings) ---
+        @Override
+        public Class<?> getColumnClass(int columnIndex) {
+            switch (columnIndex) {
+                case 0: return Integer.class; // ID
+                case 5: return Integer.class; // Status
+                case 6: return Integer.class; // Length
+                default: return String.class;
+            }
+        }
 
         @Override
         public Object getValueAt(int rowIndex, int columnIndex) {
