@@ -10,11 +10,19 @@ import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
 
 import javax.swing.*;
 import javax.swing.table.AbstractTableModel;
+import javax.swing.text.BadLocationException;
 import java.awt.*;
-import java.util.ArrayList;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.UnsupportedFlavorException;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.util.*;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 public class ApiVersionFuzzer implements BurpExtension {
 
@@ -23,19 +31,18 @@ public class ApiVersionFuzzer implements BurpExtension {
     private ResultsTableModel tableModel;
     private JLabel statusLabel;
     private JCheckBox enablePassiveScan;
+    private JTextArea versionEditor;
 
-    // Updated with your specific list
-    private static final String[] VERSION_STRINGS = {
-            "v1", "v2", "v3", "v1beta1", "v1beta2", "v1alpha1", "v1alpha2",
-            "v2beta1", "v2beta2", "v2alpha1", "v2alpha2",
-            "v3beta1", "v3beta2", "v3alpha1", "v3alpha2"
-    };
+    // Default list
+    private static final String DEFAULT_VERSIONS =
+            "v1\nv2\nv3\nv1beta1\nv1beta2\nv1alpha1\nv1alpha2\n" +
+                    "v2beta1\nv2beta2\nv2alpha1\nv2alpha2\n" +
+                    "v3beta1\nv3beta2\nv3alpha1\nv3alpha2";
 
     @Override
     public void initialize(MontoyaApi api) {
         this.api = api;
         api.extension().setName("API Version Fuzzer");
-
         this.threadPool = Executors.newCachedThreadPool();
 
         SwingUtilities.invokeLater(this::setupUI);
@@ -47,10 +54,62 @@ public class ApiVersionFuzzer implements BurpExtension {
     }
 
     private void setupUI() {
+        // --- 1. Top Panel: Configuration & Controls ---
+        JPanel topPanel = new JPanel(new BorderLayout());
+
+        // A. The Version List Editor
+        versionEditor = new JTextArea(DEFAULT_VERSIONS);
+        JScrollPane editorScroll = new JScrollPane(versionEditor);
+        editorScroll.setBorder(BorderFactory.createTitledBorder("Target Version Strings (One per line)"));
+
+        // B. List Tools (Right of Editor)
+        JPanel listToolsPanel = new JPanel(new GridLayout(5, 1, 5, 5));
+        JButton btnLoad = new JButton("Load File");
+        JButton btnPaste = new JButton("Paste");
+        JButton btnRemove = new JButton("Remove Item");
+        JButton btnDedup = new JButton("Deduplicate");
+        JButton btnClearList = new JButton("Clear List");
+
+        btnLoad.addActionListener(e -> loadFile());
+        btnPaste.addActionListener(e -> pasteClipboard());
+        btnRemove.addActionListener(e -> removeSelectedLines());
+        btnDedup.addActionListener(e -> deduplicateList());
+        btnClearList.addActionListener(e -> versionEditor.setText(""));
+
+        listToolsPanel.add(btnLoad);
+        listToolsPanel.add(btnPaste);
+        listToolsPanel.add(btnRemove);
+        listToolsPanel.add(btnDedup);
+        listToolsPanel.add(btnClearList);
+
+        // Container for Editor + Tools
+        JPanel editorContainer = new JPanel(new BorderLayout());
+        editorContainer.add(editorScroll, BorderLayout.CENTER);
+        editorContainer.add(listToolsPanel, BorderLayout.EAST);
+        editorContainer.setPreferredSize(new Dimension(800, 160));
+
+        // C. Execution Controls
+        JPanel executionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        enablePassiveScan = new JCheckBox("Enable Passive Scanning (In-Scope Only)");
+        JButton btnClearResults = new JButton("Clear Results Table");
+        statusLabel = new JLabel(" | Requests Sent: 0");
+
+        btnClearResults.addActionListener(e -> {
+            tableModel.clear();
+            statusLabel.setText(" | Requests Sent: 0");
+        });
+
+        executionPanel.add(enablePassiveScan);
+        executionPanel.add(btnClearResults);
+        executionPanel.add(statusLabel);
+
+        topPanel.add(editorContainer, BorderLayout.CENTER);
+        topPanel.add(executionPanel, BorderLayout.SOUTH);
+
+
+        // --- 2. Bottom Panel: Results Table ---
         tableModel = new ResultsTableModel();
         JTable table = new JTable(tableModel);
-
-        // --- NEW: Enable Sorting ---
         table.setAutoCreateRowSorter(true);
 
         JPopupMenu tablePopup = new JPopupMenu();
@@ -58,67 +117,117 @@ public class ApiVersionFuzzer implements BurpExtension {
         sendToRepeater.addActionListener(e -> {
             int row = table.getSelectedRow();
             if (row != -1) {
-                // When sorting is enabled, the visual row index doesn't match the model index.
-                // We must convert the index to get the correct data.
                 int modelRow = table.convertRowIndexToModel(row);
                 LogEntry entry = tableModel.getLogEntry(modelRow);
-                
                 api.repeater().sendToRepeater(entry.httpRequestResponse.request(), "Fuzzed: " + entry.modifiedPath);
             }
         });
         tablePopup.add(sendToRepeater);
         table.setComponentPopupMenu(tablePopup);
 
-        JScrollPane scrollPane = new JScrollPane(table);
+        JScrollPane tableScroll = new JScrollPane(table);
 
-        JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        enablePassiveScan = new JCheckBox("Enable Passive Scanning (In-Scope Only)");
-        JButton clearButton = new JButton("Clear History");
-        statusLabel = new JLabel(" | Requests Sent: 0");
 
-        clearButton.addActionListener(e -> {
-            tableModel.clear();
-            statusLabel.setText(" | Requests Sent: 0");
-        });
-
-        controlPanel.add(enablePassiveScan);
-        controlPanel.add(clearButton);
-        controlPanel.add(statusLabel);
-
-        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, controlPanel, scrollPane);
-        splitPane.setDividerLocation(40);
+        // --- 3. Main Split Pane ---
+        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, topPanel, tableScroll);
+        splitPane.setDividerLocation(200);
 
         api.userInterface().registerSuiteTab("API Fuzzer", splitPane);
     }
 
+    // --- Helper Methods ---
+    private void loadFile() {
+        JFileChooser fileChooser = new JFileChooser();
+        if (fileChooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
+            File file = fileChooser.getSelectedFile();
+            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                versionEditor.read(reader, null);
+            } catch (IOException ex) {
+                api.logging().logToError("Error loading file: " + ex.getMessage());
+            }
+        }
+    }
+
+    private void pasteClipboard() {
+        try {
+            String data = (String) Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
+            if (!data.startsWith("\n") && !versionEditor.getText().endsWith("\n") && !versionEditor.getText().isEmpty()) {
+                versionEditor.append("\n");
+            }
+            versionEditor.append(data);
+        } catch (IOException | UnsupportedFlavorException e) {
+            api.logging().logToError("Clipboard error: " + e.getMessage());
+        }
+    }
+
+    private void removeSelectedLines() {
+        try {
+            int start = versionEditor.getSelectionStart();
+            int end = versionEditor.getSelectionEnd();
+
+            if (start == end) {
+                // No selection: Remove the line the caret is currently on
+                int caretPos = versionEditor.getCaretPosition();
+                int lineNum = versionEditor.getLineOfOffset(caretPos);
+                int lineStart = versionEditor.getLineStartOffset(lineNum);
+                int lineEnd = versionEditor.getLineEndOffset(lineNum);
+                versionEditor.replaceRange("", lineStart, lineEnd);
+            } else {
+                // Remove the actual highlighted selection
+                versionEditor.replaceRange("", start, end);
+            }
+        } catch (BadLocationException e) {
+            // Ignore UI errors
+        }
+    }
+
+    private void deduplicateList() {
+        String text = versionEditor.getText();
+        if (text.isEmpty()) return;
+
+        // Corrected Lambda Logic
+        Set<String> lines = new LinkedHashSet<>(Arrays.asList(text.split("\\R")));
+        lines.removeIf(s -> s.trim().isEmpty());
+
+        versionEditor.setText(String.join("\n", lines));
+    }
+
+    private List<String> getTargetVersions() {
+        String text = versionEditor.getText();
+        if (text == null || text.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        return Arrays.stream(text.split("\\R"))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    // --- Fuzzing Logic ---
     private void runFuzzer(HttpRequest baseRequest, boolean checkScope) {
         HttpService service = baseRequest.httpService();
         String url = baseRequest.url();
 
-        if (baseRequest.hasHeader("X-Api-Fuzzer")) {
-            return;
-        }
+        if (baseRequest.hasHeader("X-Api-Fuzzer")) return;
+        if (checkScope && !api.scope().isInScope(url)) return;
 
-        if (checkScope && !api.scope().isInScope(url)) {
-            return;
-        }
+        List<String> versionList = getTargetVersions();
+        if (versionList.isEmpty()) return;
 
         String foundVersion = null;
-        for (String v : VERSION_STRINGS) {
+        for (String v : versionList) {
             if (url.contains("/" + v + "/") || url.endsWith("/" + v)) {
                 foundVersion = v;
                 break;
             }
         }
 
-        if (foundVersion == null) {
-            return;
-        }
+        if (foundVersion == null) return;
 
         final String originalVersion = foundVersion;
 
         threadPool.submit(() -> {
-            for (String targetVersion : VERSION_STRINGS) {
+            for (String targetVersion : versionList) {
                 if (targetVersion.equals(originalVersion)) continue;
 
                 String newPath = baseRequest.path().replace("/" + originalVersion, "/" + targetVersion);
@@ -149,6 +258,7 @@ public class ApiVersionFuzzer implements BurpExtension {
         statusLabel.setText(" | Requests Sent: " + tableModel.getRowCount());
     }
 
+    // --- Handlers ---
     private class PassiveScanner implements HttpHandler {
         @Override
         public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
@@ -172,8 +282,8 @@ public class ApiVersionFuzzer implements BurpExtension {
 
             item.addActionListener(e -> {
                 if (event.messageEditorRequestResponse().isPresent()) {
-                     MessageEditorHttpRequestResponse editorItem = event.messageEditorRequestResponse().get();
-                     runFuzzer(editorItem.requestResponse().request(), false);
+                    MessageEditorHttpRequestResponse editorItem = event.messageEditorRequestResponse().get();
+                    runFuzzer(editorItem.requestResponse().request(), false);
                 }
 
                 List<HttpRequestResponse> historyItems = event.selectedRequestResponses();
@@ -189,6 +299,7 @@ public class ApiVersionFuzzer implements BurpExtension {
         }
     }
 
+    // --- Table Model ---
     private static class LogEntry {
         final int id;
         final String method;
@@ -221,18 +332,15 @@ public class ApiVersionFuzzer implements BurpExtension {
         public int getColumnCount() { return columns.length; }
         @Override
         public String getColumnName(int column) { return columns[column]; }
-
-        // --- NEW: Define column types for correct sorting (Numbers vs Strings) ---
         @Override
         public Class<?> getColumnClass(int columnIndex) {
             switch (columnIndex) {
-                case 0: return Integer.class; // ID
-                case 5: return Integer.class; // Status
-                case 6: return Integer.class; // Length
+                case 0: return Integer.class;
+                case 5: return Integer.class;
+                case 6: return Integer.class;
                 default: return String.class;
             }
         }
-
         @Override
         public Object getValueAt(int rowIndex, int columnIndex) {
             LogEntry entry = log.get(rowIndex);
@@ -247,16 +355,11 @@ public class ApiVersionFuzzer implements BurpExtension {
                 default: return "";
             }
         }
-
         public void addLogEntry(LogEntry entry) {
             log.add(entry);
             fireTableRowsInserted(log.size() - 1, log.size() - 1);
         }
-
-        public LogEntry getLogEntry(int row) {
-            return log.get(row);
-        }
-
+        public LogEntry getLogEntry(int row) { return log.get(row); }
         public void clear() {
             log.clear();
             fireTableDataChanged();
